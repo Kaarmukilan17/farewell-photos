@@ -1,3 +1,4 @@
 node_modules
 dist
 .env
+ADMIN_GUIDE.md
