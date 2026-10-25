@@ -5,6 +5,8 @@ import { distance, MATCH_THRESHOLD } from './face.js'
 import LiveCheck from './LiveCheck.jsx'
 
 const BATCH = 50
+// open the site with ?debug=1 on the end to see each photo's match score
+const debug = new URLSearchParams(window.location.search).get('debug') === '1'
 
 const prefixOf = (email) => (email || '').split('@')[0]
 const nameOf = (p) => (p.uploader_name || prefixOf(p.uploader) || 'unknown').trim()
@@ -70,11 +72,16 @@ export default function Find({ user }) {
       const refs = [...mine, ...frames]
       const best = new Map()
       for (const f of faces) {
-        let d = Infinity
-        for (const r of refs) d = Math.min(d, distance(r, f.descriptor))
+        // score = the 2nd closest selfie frame, so one lucky frame cannot cause a wrong match
+        const ds = refs.map((r) => distance(r, f.descriptor)).sort((a, b) => a - b)
+        const d = ds.length > 1 ? ds[1] : ds[0]
         if (d < MATCH_THRESHOLD) best.set(f.photo_id, Math.min(best.get(f.photo_id) ?? 9, d))
       }
-      const ids = [...best.keys()]
+      // photos this person already marked "Not me" stay hidden
+      const { data: hid } = await supabase
+        .from('match_feedback').select('photo_id').eq('user_email', user.email)
+      const hidden = new Set((hid || []).map((h) => h.photo_id))
+      const ids = [...best.keys()].filter((id) => !hidden.has(id))
       const rows = []
       for (let i = 0; i < ids.length; i += 200) {
         const { data, error } = await supabase
@@ -94,7 +101,9 @@ export default function Find({ user }) {
         urls.push(...(data || []))
       }
       const urlMap = new Map(urls.map((u) => [u.path, u.signedUrl]))
-      setPhotos(rows.map((r) => ({ ...r, url: urlMap.get(r.path) })))
+      setPhotos(rows.map((r) => ({ ...r, url: urlMap.get(r.path), dist: best.get(r.id) })))
+      // count of photos shown, so you can compare it with the Not me reports later
+      supabase.from('search_log').insert({ user_email: user.email, shown: rows.length }).then(() => {})
       setStatus('')
       setStage('results')
     } catch (e) {
@@ -121,6 +130,18 @@ export default function Find({ user }) {
 
   const toggle = (id) =>
     setSelected((s) => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n })
+
+  async function notMe(p) {
+    const { error } = await supabase
+      .from('match_feedback')
+      .insert({ user_email: user.email, photo_id: p.id, distance: p.dist })
+    if (error && error.code !== '23505') {
+      setStatus('Could not save that: ' + error.message)
+      return
+    }
+    setPhotos((list) => list.filter((x) => x.id !== p.id))
+    setSelected((s) => { const n = new Set(s); n.delete(p.id); return n })
+  }
 
   async function markDownloaded() {
     const now = new Date().toISOString()
@@ -197,7 +218,7 @@ export default function Find({ user }) {
           <button onClick={() => downloadList(chosen)} disabled={!chosen.length}>Download selected ({chosen.length})</button>
           <button className="ghost" onClick={() => setStage('verify')}>Search again</button>
         </div>
-        <p className="muted">Downloads are split into zip files of {BATCH} photos. Allow multiple downloads if your browser asks. Tap a photo to select it.</p>
+        <p className="muted">Downloads are split into zip files of {BATCH} photos. Allow multiple downloads if your browser asks. Tap a photo to select it. If a photo is not you, tap "Not me" on it and it will be hidden.</p>
         {status && <p className="warn">{status}</p>}
       </div>
 
@@ -222,7 +243,13 @@ export default function Find({ user }) {
           <div key={p.id} className={'thumb ' + (selected.has(p.id) ? 'sel' : '')} onClick={() => toggle(p.id)}>
             <img src={p.url} loading="lazy" />
             {isNew(p) && <span className="badge small">NEW</span>}
-            <span className="cap">{nameOf(p)}</span>
+            <button
+              className="notme"
+              onClick={(e) => { e.stopPropagation(); notMe(p) }}
+            >
+              Not me
+            </button>
+            <span className="cap">{debug && p.dist != null ? p.dist.toFixed(2) + ' | ' : ''}{nameOf(p)}</span>
           </div>
         ))}
       </div>
