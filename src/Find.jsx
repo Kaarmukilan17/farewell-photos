@@ -71,7 +71,9 @@ export default function Find({ user }) {
 
       setStatus('Scanning all photos...')
       const faces = await fetchAllFaces()
-      const refs = [...mine, ...frames]
+      // match against the saved registration only, so every search gives the same result.
+      // the live frames are only used above, to check that it is really you
+      const refs = mine
       const best = new Map()
       for (const f of faces) {
         // score = the 2nd closest selfie frame, so one lucky frame cannot cause a wrong match
