@@ -1,7 +1,7 @@
 import * as faceapi from '@vladmandic/face-api'
 
 const MODEL_URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.14/model/'
-export const MATCH_THRESHOLD = 0.5
+export const MATCH_THRESHOLD = 0.45
 
 let ready
 export function loadModels() {
