@@ -237,7 +237,7 @@ export default function Find({ user }) {
         <h2>{stage === 'enroll' ? 'Register your face' : 'Find my photos'}</h2>
         <p className="muted">
           {stage === 'enroll'
-            ? 'First time only: take a live selfie. It is locked to your college email, so nobody else can search for your photos. Take it the way you usually look in photos, so if you wear glasses, keep them on. Use good light.'
+            ? 'First time only, about 15 seconds: the camera will ask you to look straight, smile, and turn your head a little each way. This is locked to your college email, so nobody else can search for your photos. Look the way you usually do in photos (keep your glasses on if you wear them) and use good light.'
             : 'Take a quick live selfie to find every photo you appear in, including new ones.'}
         </p>
         {status && <p className="warn">{status}</p>}
@@ -246,7 +246,13 @@ export default function Find({ user }) {
     )
 
   if (stage.endsWith('-cam'))
-    return <LiveCheck onDone={onLive} onCancel={() => setStage(stage.replace('-cam', ''))} />
+    return (
+      <LiveCheck
+        mode={stage.startsWith('enroll') ? 'enroll' : 'verify'}
+        onDone={onLive}
+        onCancel={() => setStage(stage.replace('-cam', ''))}
+      />
+    )
 
   if (stage === 'searching') return <div className="card center"><p className="big">{status}</p></div>
 
