@@ -126,6 +126,10 @@ export default function Upload({ user }) {
         Keep this page open until the summary appears.
       </p>
       <p className="muted">
+        Check your gallery for farewell photos of friends that you have not shared yet, and upload
+        those. There is no need to upload photos you have already shared with everyone in them.
+      </p>
+      <p className="muted">
         Your name ({displayName}) and college email are shown to people who download your photos, so
         they can ask you for the original quality.
       </p>
