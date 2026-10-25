@@ -109,3 +109,10 @@ video.mirror { transform: scaleX(-1); }
   padding: 3px 8px; font-size: .7rem; border-radius: 12px;
   background: rgba(0, 0, 30, 0.7); color: #fff;
 }
+
+.tick {
+  position: absolute; top: 6px; right: 6px;
+  padding: 3px 8px; font-size: .7rem; border-radius: 12px;
+  background: #3d63ff; color: #fff;
+}
+button.ghost.danger { color: #c92a2a; border-color: #c92a2a; }
