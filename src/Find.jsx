@@ -1,10 +1,12 @@
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import JSZip from 'jszip'
 import { supabase } from './supabase.js'
 import { distance, MATCH_THRESHOLD } from './face.js'
 import LiveCheck from './LiveCheck.jsx'
 
 const BATCH = 50
+const CANDIDATE_LIMIT = 0.55 // solo photos up to this score can be used to improve a profile
+const MAX_FRAMES = 12 // most saved looks per person
 // open the site with ?debug=1 on the end to see each photo's match score
 const debug = new URLSearchParams(window.location.search).get('debug') === '1'
 
@@ -31,13 +33,17 @@ async function fetchAllFaces() {
 export default function Find({ user }) {
   const [stage, setStage] = useState('loading') // loading | enroll | verify | searching | results
   const [profile, setProfile] = useState(null)
-  const [photos, setPhotos] = useState([]) // includes hidden ones (hidden: true)
+  const [verified, setVerified] = useState(false)
+  const [photos, setPhotos] = useState([]) // every row we loaded
   const [onlyNew, setOnlyNew] = useState(false)
   const [selected, setSelected] = useState(new Set())
   const [selectedHidden, setSelectedHidden] = useState(new Set())
+  const [selectedCand, setSelectedCand] = useState(new Set())
   const [showHidden, setShowHidden] = useState(false)
+  const [showImprove, setShowImprove] = useState(false)
   const [status, setStatus] = useState('')
   const [lastDownload, setLastDownload] = useState(null)
+  const facesRef = useRef(null)
 
   useEffect(() => {
     supabase.from('profiles').select('*').eq('email', user.email).maybeSingle().then(({ data }) => {
@@ -47,39 +53,27 @@ export default function Find({ user }) {
     })
   }, [])
 
-  async function onLive(frames) {
+  // Compare every stored face with the saved profile and load the matching photos
+  async function runSearch(mine, refetch = true) {
     setStage('searching')
-    setStatus('Checking that it is really you...')
+    setStatus('Scanning all photos...')
     try {
-      let mine = profile?.descriptors
-      if (!mine) {
-        // first time: lock this face to this college email
-        const { error } = await supabase
-          .from('profiles')
-          .insert({ email: user.email, descriptors: frames })
-        if (error) throw error
-        mine = frames
-        setProfile({ email: user.email, descriptors: frames })
-      } else {
-        const ok = frames.some((f) => mine.some((m) => distance(f, m) < MATCH_THRESHOLD))
-        if (!ok) {
-          setStatus('This face does not match the one registered for your email.')
-          setStage('verify')
-          return
-        }
-      }
+      if (refetch || !facesRef.current) facesRef.current = await fetchAllFaces()
+      const faces = facesRef.current
 
-      setStatus('Scanning all photos...')
-      const faces = await fetchAllFaces()
-      // match against the saved registration only, so every search gives the same result.
-      // the live frames are only used above, to check that it is really you
-      const refs = mine
-      const best = new Map()
+      const counts = new Map()
+      for (const f of faces) counts.set(f.photo_id, (counts.get(f.photo_id) || 0) + 1)
+
+      const scores = new Map() // photo -> best score, kept if under the loose limit
+      const soloFace = new Map() // photo with exactly one face -> that face
       for (const f of faces) {
-        // score = the 2nd closest selfie frame, so one lucky frame cannot cause a wrong match
-        const ds = refs.map((r) => distance(r, f.descriptor)).sort((a, b) => a - b)
+        // score = the 2nd closest saved frame, so one lucky frame cannot cause a wrong match
+        const ds = mine.map((r) => distance(r, f.descriptor)).sort((a, b) => a - b)
         const d = ds.length > 1 ? ds[1] : ds[0]
-        if (d < MATCH_THRESHOLD) best.set(f.photo_id, Math.min(best.get(f.photo_id) ?? 9, d))
+        if (d < CANDIDATE_LIMIT) {
+          scores.set(f.photo_id, Math.min(scores.get(f.photo_id) ?? 9, d))
+          if (counts.get(f.photo_id) === 1) soloFace.set(f.photo_id, f.descriptor)
+        }
       }
 
       // photos this person marked "Not me" earlier
@@ -87,7 +81,13 @@ export default function Find({ user }) {
         .from('match_feedback').select('photo_id').eq('user_email', user.email)
       const hidden = new Set((hid || []).map((h) => h.photo_id))
 
-      const ids = [...best.keys()]
+      const matchedIds = [...scores.keys()].filter((id) => scores.get(id) < MATCH_THRESHOLD)
+      const candIds = [...soloFace.keys()]
+        .filter((id) => !hidden.has(id))
+        .sort((a, b) => scores.get(a) - scores.get(b))
+        .slice(0, 30)
+      const ids = [...new Set([...matchedIds, ...candIds])]
+
       const rows = []
       for (let i = 0; i < ids.length; i += 200) {
         const { data, error } = await supabase
@@ -107,32 +107,77 @@ export default function Find({ user }) {
         urls.push(...(data || []))
       }
       const urlMap = new Map(urls.map((u) => [u.path, u.signedUrl]))
-      setPhotos(
-        rows.map((r) => ({
-          ...r,
-          url: urlMap.get(r.path),
-          dist: best.get(r.id),
-          hidden: hidden.has(r.id),
-        }))
-      )
+      const all = rows.map((r) => ({
+        ...r,
+        url: urlMap.get(r.path),
+        dist: scores.get(r.id),
+        matched: scores.get(r.id) < MATCH_THRESHOLD,
+        hidden: hidden.has(r.id),
+        solo: soloFace.has(r.id),
+        faceDesc: soloFace.get(r.id) || null,
+      }))
+      setPhotos(all)
       // how many photos were shown, to compare with the Not me reports later
       supabase
         .from('search_log')
-        .insert({ user_email: user.email, shown: rows.filter((r) => !hidden.has(r.id)).length })
+        .insert({ user_email: user.email, shown: all.filter((p) => p.matched && !p.hidden).length })
         .then(() => {})
       setSelected(new Set())
       setSelectedHidden(new Set())
+      setSelectedCand(new Set())
       setStatus('')
       setStage('results')
+    } catch (e) {
+      setStatus('Error: ' + (e.message || e))
+      setStage('verify')
+    }
+  }
+
+  async function onLive(frames) {
+    setStage('searching')
+    setStatus('Checking that it is really you...')
+    try {
+      let mine = profile?.descriptors
+      if (!mine) {
+        // first time: lock these looks to this college email
+        const { error } = await supabase
+          .from('profiles')
+          .insert({ email: user.email, descriptors: frames })
+        if (error) throw error
+        mine = frames
+        setProfile({ email: user.email, descriptors: frames })
+      } else {
+        const ok = frames.some((f) => mine.some((m) => distance(f, m) < MATCH_THRESHOLD))
+        if (!ok) {
+          setStatus('This face does not match the one registered for your email.')
+          setStage('verify')
+          return
+        }
+      }
+      setVerified(true)
+      await runSearch(mine, true)
     } catch (e) {
       setStatus('Error: ' + (e.message || e))
       setStage(profile ? 'verify' : 'enroll')
     }
   }
 
+  async function refresh() {
+    if (!verified || !profile) {
+      setStatus('')
+      setStage('verify')
+      return
+    }
+    await runSearch(profile.descriptors, true)
+  }
+
   const isNew = (p) => !lastDownload || new Date(p.created_at) > new Date(lastDownload)
-  const visible = useMemo(() => photos.filter((p) => !p.hidden), [photos])
-  const hiddenList = useMemo(() => photos.filter((p) => p.hidden), [photos])
+  const visible = useMemo(() => photos.filter((p) => p.matched && !p.hidden), [photos])
+  const hiddenList = useMemo(() => photos.filter((p) => p.matched && p.hidden), [photos])
+  const candidates = useMemo(
+    () => photos.filter((p) => p.solo && !p.hidden).sort((a, b) => a.dist - b.dist).slice(0, 30),
+    [photos]
+  )
   const shown = useMemo(() => (onlyNew ? visible.filter(isNew) : visible), [visible, onlyNew, lastDownload])
   const newCount = useMemo(() => visible.filter(isNew).length, [visible, lastDownload])
 
@@ -148,10 +193,11 @@ export default function Find({ user }) {
     return [...m.values()].sort((a, b) => b.count - a.count)
   }, [shown])
 
-  const toggle = (id) =>
-    setSelected((s) => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n })
-  const toggleHidden = (id) =>
-    setSelectedHidden((s) => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n })
+  const flip = (setter) => (id) =>
+    setter((s) => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n })
+  const toggle = flip(setSelected)
+  const toggleHidden = flip(setSelectedHidden)
+  const toggleCand = flip(setSelectedCand)
 
   async function hideSelected() {
     const list = visible.filter((p) => selected.has(p.id))
@@ -189,6 +235,44 @@ export default function Find({ user }) {
     setPhotos((l) => l.map((p) => (done.has(p.id) ? { ...p, hidden: false } : p)))
     setSelectedHidden(new Set())
     setStatus(done.size + ' photo(s) restored.')
+  }
+
+  // Add the face from chosen solo photos to the saved profile
+  async function addToProfile() {
+    const list = candidates.filter((p) => selectedCand.has(p.id))
+    if (!list.length || !profile) return
+    const mine = profile.descriptors
+    const room = MAX_FRAMES - mine.length
+    if (room <= 0) {
+      setStatus('Your profile already has the maximum number of saved looks (' + MAX_FRAMES + ').')
+      return
+    }
+    const ok = window.confirm(
+      'Add ' + list.length + ' selected photo(s) to your profile? Only choose photos where you are the only person.'
+    )
+    if (!ok) return
+    const add = []
+    for (const p of list) {
+      const d = Array.from(p.faceDesc)
+      const closest = Math.min(...mine.map((m) => distance(m, d)))
+      if (closest < 0.05) continue // already saved
+      if (closest >= CANDIDATE_LIMIT) continue // does not look like the registered face
+      add.push(d)
+      if (add.length >= room) break
+    }
+    if (!add.length) {
+      setStatus('Nothing new to add from those photos.')
+      return
+    }
+    const next = [...mine, ...add]
+    const { error } = await supabase.from('profiles').update({ descriptors: next }).eq('email', user.email)
+    if (error) {
+      setStatus('Could not save: ' + error.message)
+      return
+    }
+    setProfile({ ...profile, descriptors: next })
+    await runSearch(next, false)
+    setStatus('Profile improved with ' + add.length + ' new look(s). Your photos were refreshed.')
   }
 
   async function markDownloaded() {
@@ -233,17 +317,30 @@ export default function Find({ user }) {
 
   if (stage === 'loading') return <div className="card">Loading...</div>
 
-  if (stage === 'enroll' || stage === 'verify')
+  if (stage === 'enroll')
     return (
       <div className="card center">
-        <h2>{stage === 'enroll' ? 'Register your face' : 'Find my photos'}</h2>
+        <h2>Register your face</h2>
         <p className="muted">
-          {stage === 'enroll'
-            ? 'First time only, about 15 seconds: the camera will ask you to look straight, smile, and turn your head a little each way. This is locked to your college email, so nobody else can search for your photos. Look the way you usually do in photos (keep your glasses on if you wear them) and use good light.'
-            : 'Take a quick live selfie to find every photo you appear in, including new ones.'}
+          First time only, about 15 seconds: the camera will ask you to look straight, smile, and turn your
+          head a little each way. This is locked to your college email, so nobody else can search for your
+          photos. Look the way you usually do in photos (keep your glasses on if you wear them) and use good
+          light. Your selfie is never saved.
         </p>
         {status && <p className="warn">{status}</p>}
-        <button onClick={() => { setStatus(''); setStage(stage + '-cam') }}>Open camera</button>
+        <button onClick={() => { setStatus(''); setStage('enroll-cam') }}>Open camera</button>
+      </div>
+    )
+
+  if (stage === 'verify')
+    return (
+      <div className="card center">
+        <h2>Verify it is you</h2>
+        <p className="muted">
+          A quick face check to confirm it is you, then your photos load. Your selfie is never saved.
+        </p>
+        {status && <p className="warn">{status}</p>}
+        <button onClick={() => { setStatus(''); setStage('verify-cam') }}>Verify and find my photos</button>
       </div>
     )
 
@@ -259,6 +356,7 @@ export default function Find({ user }) {
   if (stage === 'searching') return <div className="card center"><p className="big">{status}</p></div>
 
   const chosen = visible.filter((p) => selected.has(p.id))
+  const savedLooks = profile?.descriptors?.length || 0
   return (
     <div>
       <div className="card">
@@ -273,10 +371,10 @@ export default function Find({ user }) {
         </div>
         <div className="row">
           <button className="ghost danger" onClick={hideSelected} disabled={!chosen.length}>Not me ({chosen.length})</button>
-          <button className="ghost" onClick={() => setStage('verify')}>Search again</button>
+          <button className="ghost" onClick={refresh}>Refresh my photos</button>
         </div>
         <p className="muted">
-          Tap photos to select them. Downloads are split into zip files of {BATCH} photos. If some selected photos are not you, press "Not me" and they will be hidden from your results. You can restore them any time.
+          Tap photos to select them. Downloads are split into zip files of {BATCH} photos. If some selected photos are not you, press "Not me" and they will be hidden from your results. You can restore them any time. Missing some of your photos? Use "Improve my profile" at the bottom.
         </p>
         {status && <p className="warn">{status}</p>}
       </div>
@@ -308,8 +406,40 @@ export default function Find({ user }) {
         ))}
       </div>
 
+      <div className="card" style={{ marginTop: 14 }}>
+        <h3>Improve my profile</h3>
+        <p className="muted">
+          Missing some of your photos? Pick a few clear photos where you are the <b>only person</b>. They
+          are added to your saved face, so more of your photos are found. Only solo photos that look like
+          your registered face are listed. Saved looks: {savedLooks} of {MAX_FRAMES}.
+        </p>
+        <button className="ghost" onClick={() => setShowImprove((v) => !v)}>
+          {showImprove ? 'Close' : 'Choose solo photos'}
+        </button>
+        {showImprove && (
+          <div>
+            {candidates.length === 0 ? (
+              <p className="muted">No solo photos of you were found yet. Check again after more photos are uploaded.</p>
+            ) : (
+              <div className="grid" style={{ marginTop: 10 }}>
+                {candidates.map((p) => (
+                  <div key={p.id} className={'thumb ' + (selectedCand.has(p.id) ? 'sel' : '')} onClick={() => toggleCand(p.id)}>
+                    <img src={p.url} loading="lazy" />
+                    {selectedCand.has(p.id) && <span className="tick">Selected</span>}
+                    <span className="cap">{debug ? p.dist.toFixed(2) + ' | ' : ''}{nameOf(p)}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+            <button onClick={addToProfile} disabled={!selectedCand.size}>
+              Add to my profile ({selectedCand.size})
+            </button>
+          </div>
+        )}
+      </div>
+
       {hiddenList.length > 0 && (
-        <div className="card" style={{ marginTop: 14 }}>
+        <div className="card">
           <h3>Hidden photos ({hiddenList.length})</h3>
           <p className="muted">These are the photos you marked as not you. If you hid one by mistake, select it and restore it.</p>
           <button className="ghost" onClick={() => setShowHidden((v) => !v)}>
